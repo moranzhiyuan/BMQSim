@@ -188,6 +188,19 @@ namespace SVSim
         ofs.close();
     }
 
+#ifdef BMQSIM_RAM_ONLY
+    [[noreturn]] void cufileWrite(const char *dir, void *, size_t)
+    {
+        std::cerr << "SSD spill is unavailable in the RAM-only build: " << dir << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    [[noreturn]] void cufileRead(const char *dir, void *, size_t)
+    {
+        std::cerr << "SSD read is unavailable in the RAM-only build: " << dir << std::endl;
+        exit(EXIT_FAILURE);
+    }
+#else
     void cufileWrite(const char *dir, void *inputPtrDevice, const size_t size)
     {
         CUfileDescr_t cf_descr;
@@ -265,6 +278,8 @@ namespace SVSim
         cuFileHandleDeregister(cf_handle);
         close(fd);
     }
+
+#endif
 
     __global__ void log2Transform(double *input, IdxType n, int8_t *signArr)
     {

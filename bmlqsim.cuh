@@ -6,15 +6,13 @@
 #define PWR_ERROR_BOUND 1e-3
 
 #include <assert.h>
-#include <cooperative_groups.h>
+#include "bmqsim_platform.hpp"
 #include <vector>
 #include <omp.h>
 #include <sstream>
 #include <string>
 #include <iostream>
 #include <thread>
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <bitset>
 #include <algorithm>
 #include <chrono>
@@ -28,7 +26,9 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <cstring>
+#ifndef BMQSIM_RAM_ONLY
 #include "cufile.h"
+#endif
 
 #include <sys/sysinfo.h>
 
@@ -36,8 +36,14 @@
 #include <thrust/execution_policy.h>
 
 #include "config.hpp"
-#include "utils.cuh"
+#ifdef BMQSIM_USE_PFPL
+#include "bmqsim_pfpl.hpp"
+#define BMQSIM_CHECK_CODEC(call) CHECK_BITCOMP(call)
+#else
 #include <native/bitcomp.h>
+#define BMQSIM_CHECK_CODEC(call) call
+#endif
+#include "utils.cuh"
 
 namespace SVSim
 {
@@ -267,16 +273,20 @@ namespace SVSim
 
             std::cout << "CPU free memory: " << info.freeram / 1024 / 1024 / 1024 << " GB" << std::endl;
 
+#ifndef BMQSIM_RAM_ONLY
             CUfileError_t status;
+#endif
             for (unsigned d = 0; d < numGpus; d++)
             {
                 cudaSafeCall(cudaSetDevice(d));
+#ifndef BMQSIM_RAM_ONLY
                 status = cuFileDriverOpen();
                 if (status.err != CU_FILE_SUCCESS)
                 {
                     std::cerr << " cuFile driver failed to open " << std::endl;
                     return;
                 }
+#endif
             }
 
             streamNumPerGpu = 2;
@@ -318,12 +328,12 @@ namespace SVSim
             memset(chunkLocationImagArr, 0, sizeof(int8_t) * chunkNum);
 
             bitcompHandle_t plan;
-            bitcompCreatePlan(
+            BMQSIM_CHECK_CODEC(bitcompCreatePlan(
                 &plan,                                // Bitcomp handle
                 sizeof(ValType) * exp2Int(chunkSize), // Size in bytes of the uncompressed data
                 BITCOMP_FP64_DATA,                    // Data type
                 BITCOMP_LOSSY_FP_TO_SIGNED,           // Compression type
-                BITCOMP_DEFAULT_ALGO);                // Bitcomp algo, default or sparse
+                BITCOMP_DEFAULT_ALGO));                // Bitcomp algo, default or sparse
 
             IdxType maxlen = bitcompMaxBuflen(sizeof(ValType) * exp2Int(chunkSize));
 
@@ -348,7 +358,7 @@ namespace SVSim
             ValType *synthesisDataComped;
 
             SAFE_ALOC_HOST(synthesisData, sizeof(ValType) * exp2Int(chunkSize));
-            SAFE_ALOC_HOST(synthesisDataComped, sizeof(ValType) * exp2Int(chunkSize));
+            SAFE_ALOC_HOST(synthesisDataComped, sizeof(ValType) * compressedSlotWords());
 
             for (int i = 0; i < exp2Int(chunkSize); i++)
             {
@@ -363,7 +373,7 @@ namespace SVSim
 
             size_t compedSize = 0;
 
-            bitcompGetCompressedSize(synthesisDataComped, &compedSize);
+            BMQSIM_CHECK_CODEC(bitcompGetCompressedSize(synthesisDataComped, &compedSize));
 
             // the main memory compressed chunk allocation
 
@@ -437,11 +447,13 @@ namespace SVSim
             SAFE_FREE_HOST(chunkLocationRealArr);
             SAFE_FREE_HOST(chunkLocationImagArr);
 
+#ifndef BMQSIM_RAM_ONLY
             for (unsigned d = 0; d < numGpus; d++)
             {
                 // cout << "Closing File Driver." << std::endl;
                 (void)cuFileDriverClose();
             }
+#endif
 
             for (unsigned d = 0; d < numGpus; d++)
             {
@@ -650,11 +662,26 @@ namespace SVSim
             }
         }
 
+        size_t compressedSlotWords() const
+        {
+#ifdef BMQSIM_USE_PFPL
+            const size_t bytes = bitcompMaxBuflen(sizeof(ValType) * exp2Int(chunkSize));
+            if (bytes == 0)
+            {
+                std::cerr << "Unsupported PFPL input chunk size" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            return bytes / sizeof(ValType) + (bytes % sizeof(ValType) != 0);
+#else
+            return exp2Int(chunkSize);
+#endif
+        }
+
         void getMaxChunkNum()
         {
             size_t freeByte;
             size_t totalByte;
-            size_t freeByteArr[numGpus] = {};
+            std::vector<size_t> freeByteArr(numGpus);
 
             for (IdxType tmpIdx = 0; tmpIdx < numGpus; tmpIdx++)
             {
@@ -663,10 +690,22 @@ namespace SVSim
                 freeByteArr[tmpIdx] = freeByte;
             }
 
-            size_t *minFreeByte = std::min_element(freeByteArr, freeByteArr + numGpus);
+            const auto minFreeByte = std::min_element(freeByteArr.begin(), freeByteArr.end());
             float freeGB = *minFreeByte / 1024.0 / 1024.0 / 1024.0;
             std::cout << "the minimum free memory among GPUs is " << freeGB << " GB" << std::endl;
             size_t maxChunkNumPerGpu = *minFreeByte >> (chunkSize + 4 + 2);
+#ifdef BMQSIM_USE_PFPL
+            // Add just the PFPL packet expansion to the upstream budget.
+            const size_t slotWords = compressedSlotWords();
+            const size_t rawWords = exp2Int(chunkSize);
+            if (slotWords > rawWords)
+            {
+                const size_t extraBytes =
+                    (slotWords - rawWords) * sizeof(ValType) * 2 * streamNumPerGpu;
+                const size_t originalBytes = size_t{1} << (chunkSize + 4 + 2);
+                maxChunkNumPerGpu = *minFreeByte / (originalBytes + extraBytes);
+            }
+#endif
             maxGlobalInnerNum = static_cast<IdxType>(log2(static_cast<double>(maxChunkNumPerGpu)));
             size_t logNumGpus = floor(log((double)numGpus + 0.5) / log(2.0));
             size_t logStreamNumPerGpu = floor(log((double)streamNumPerGpu + 0.5) / log(2.0));
@@ -689,6 +728,8 @@ namespace SVSim
             }
 
             // initialize the buffers on device arr[gpuIndex][bufferIndex][dataIndex]
+            const size_t compressedBytes =
+                sizeof(ValType) * compressedSlotWords() * exp2Int(maxGlobalInnerNum);
             deviceRealCompressedBufferArr = (ValType ***)malloc(sizeof(ValType **) * numGpus);
             deviceImagCompressedBufferArr = (ValType ***)malloc(sizeof(ValType **) * numGpus);
             for (IdxType tmpIdx = 0; tmpIdx < numGpus; tmpIdx++)
@@ -698,8 +739,8 @@ namespace SVSim
                 for (IdxType tmpIdx2 = 0; tmpIdx2 < streamNumPerGpu; tmpIdx2++)
                 {
                     cudaSetDevice(tmpIdx);
-                    cudaMalloc((void **)&deviceRealCompressedBufferArr[tmpIdx][tmpIdx2], sizeof(ValType) * exp2Int(chunkSize + maxGlobalInnerNum));
-                    cudaMalloc((void **)&deviceImagCompressedBufferArr[tmpIdx][tmpIdx2], sizeof(ValType) * exp2Int(chunkSize + maxGlobalInnerNum));
+                    cudaMalloc((void **)&deviceRealCompressedBufferArr[tmpIdx][tmpIdx2], compressedBytes);
+                    cudaMalloc((void **)&deviceImagCompressedBufferArr[tmpIdx][tmpIdx2], compressedBytes);
                 }
             }
 
@@ -795,21 +836,26 @@ namespace SVSim
             bitcompHandle_t **planArr = (bitcompHandle_t **)malloc(sizeof(bitcompHandle_t *) * numGpus);
             for (IdxType tmpIdx = 0; tmpIdx < numGpus; tmpIdx++)
             {
+#ifdef BMQSIM_USE_PFPL
+                cudaSafeCall(cudaSetDevice(tmpIdx));
+#endif
                 planArr[tmpIdx] = (bitcompHandle_t *)malloc(sizeof(bitcompHandle_t) * streamNumPerGpu);
                 for (IdxType tmpIdx2 = 0; tmpIdx2 < streamNumPerGpu; tmpIdx2++)
                 {
-                    bitcompCreatePlan(
+                    BMQSIM_CHECK_CODEC(bitcompCreatePlan(
                         &planArr[tmpIdx][tmpIdx2],            // Bitcomp handle
                         sizeof(ValType) * exp2Int(chunkSize), // Size in bytes of the uncompressed data
                         BITCOMP_FP64_DATA,                    // Data type
                         BITCOMP_LOSSY_FP_TO_SIGNED,           // Compression type
-                        BITCOMP_DEFAULT_ALGO);                // Bitcomp algo, default or sparse
-                    bitcompSetStream(planArr[tmpIdx][tmpIdx2], streamArr[tmpIdx][tmpIdx2]);
+                        BITCOMP_DEFAULT_ALGO));                // Bitcomp algo, default or sparse
+                    BMQSIM_CHECK_CODEC(bitcompSetStream(planArr[tmpIdx][tmpIdx2], streamArr[tmpIdx][tmpIdx2]));
                 }
             }
 
             // calculate the maximum compressed size for a given uncompressed size
             IdxType maxlen = bitcompMaxBuflen(sizeof(ValType) * exp2Int(chunkSize));
+
+            const size_t compressedStride = compressedSlotWords();
 
             // preparation for the main for loop
             IdxType gpuIdx = 0;
@@ -825,22 +871,22 @@ namespace SVSim
                 {
                     if (chunkLocationRealArr[globalIndex.to_ulong() >> chunkSize] == 0)
                     {
-                        cudaMemcpyAsync(deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svRealCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyHostToDevice, streamArr[gpuIdx][streamIdx]);
+                        cudaMemcpyAsync(deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svRealCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyHostToDevice, streamArr[gpuIdx][streamIdx]);
                     }
                     else if (chunkLocationRealArr[globalIndex.to_ulong() >> chunkSize] == 1)
                     {
                         std::string filePathStrReal = ssdPath + std::to_string(globalIndex.to_ulong() >> chunkSize) + ".real";
-                        cufileRead(filePathStrReal.c_str(), deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
+                        cufileRead(filePathStrReal.c_str(), deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
                     }
 
                     if (chunkLocationImagArr[globalIndex.to_ulong() >> chunkSize] == 0)
                     {
-                        cudaMemcpyAsync(deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svImagCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyHostToDevice, streamArr[gpuIdx][streamIdx]);
+                        cudaMemcpyAsync(deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svImagCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyHostToDevice, streamArr[gpuIdx][streamIdx]);
                     }
                     else if (chunkLocationImagArr[globalIndex.to_ulong() >> chunkSize] == 1)
                     {
                         std::string filePathStrImag = ssdPath + std::to_string(globalIndex.to_ulong() >> chunkSize) + ".imag";
-                        cufileRead(filePathStrImag.c_str(), deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
+                        cufileRead(filePathStrImag.c_str(), deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
                     }
 
                     cudaMemcpyAsync(deviceRealSignBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svRealSignPtrHost[globalIndex.to_ulong() >> chunkSize], sizeof(int8_t) * exp2Int(chunkSize), cudaMemcpyHostToDevice, streamArr[gpuIdx][streamIdx]);
@@ -852,8 +898,8 @@ namespace SVSim
                 cudaSetDevice(gpuIdx);
                 for (IdxType tmpGlobalInnerIndex = 0; tmpGlobalInnerIndex < exp2Int(globalInnerArrSize); tmpGlobalInnerIndex++)
                 {
-                    CHECK_BITCOMP(bitcompUncompress(planArr[gpuIdx][streamIdx], deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svRealPtrArrDevice[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize)));
-                    CHECK_BITCOMP(bitcompUncompress(planArr[gpuIdx][streamIdx], deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svImagPtrArrDeivce[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize)));
+                    CHECK_BITCOMP(bitcompUncompress(planArr[gpuIdx][streamIdx], deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svRealPtrArrDevice[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize)));
+                    CHECK_BITCOMP(bitcompUncompress(planArr[gpuIdx][streamIdx], deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svImagPtrArrDeivce[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize)));
                 }
                 for (IdxType tmpGlobalInnerIndex = 0; tmpGlobalInnerIndex < exp2Int(globalInnerArrSize); tmpGlobalInnerIndex++)
                 {
@@ -883,11 +929,11 @@ namespace SVSim
 
                 for (IdxType tmpGlobalInnerIndex = 0; tmpGlobalInnerIndex < exp2Int(globalInnerArrSize); tmpGlobalInnerIndex++)
                 {
-                    CHECK_BITCOMP(bitcompCompressLossy_fp64(planArr[gpuIdx][streamIdx], svRealPtrArrDevice[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize), deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), absErrorBound));
-                    CHECK_BITCOMP(bitcompCompressLossy_fp64(planArr[gpuIdx][streamIdx], svImagPtrArrDeivce[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize), deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), absErrorBound));
+                    CHECK_BITCOMP(bitcompCompressLossy_fp64(planArr[gpuIdx][streamIdx], svRealPtrArrDevice[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize), deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, absErrorBound));
+                    CHECK_BITCOMP(bitcompCompressLossy_fp64(planArr[gpuIdx][streamIdx], svImagPtrArrDeivce[gpuIdx] + streamIdx * (1 << (chunkSize + globalInnerArrSize)) + tmpGlobalInnerIndex * exp2Int(chunkSize), deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, absErrorBound));
 
-                    bitcompGetCompressedSizeAsync(deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), compressedSizeRealDevice[gpuIdx] + (globalIndex.to_ulong() >> chunkSize), streamArr[gpuIdx][streamIdx]);
-                    bitcompGetCompressedSizeAsync(deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), compressedSizeImagDevice[gpuIdx] + (globalIndex.to_ulong() >> chunkSize), streamArr[gpuIdx][streamIdx]);
+                    BMQSIM_CHECK_CODEC(bitcompGetCompressedSizeAsync(deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, compressedSizeRealDevice[gpuIdx] + (globalIndex.to_ulong() >> chunkSize), streamArr[gpuIdx][streamIdx]));
+                    BMQSIM_CHECK_CODEC(bitcompGetCompressedSizeAsync(deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, compressedSizeImagDevice[gpuIdx] + (globalIndex.to_ulong() >> chunkSize), streamArr[gpuIdx][streamIdx]));
 
                     increment(globalIndex, globalInnerArr, globalInnerArrSize);
                 }
@@ -909,24 +955,24 @@ namespace SVSim
                     {
                         chunkLocationRealArr[globalIndex.to_ulong() >> chunkSize] = 1;
                         std::string filePathStrReal = ssdPath + std::to_string(globalIndex.to_ulong() >> chunkSize) + ".real";
-                        cufileWrite(filePathStrReal.c_str(), deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
+                        cufileWrite(filePathStrReal.c_str(), deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
                     }
                     else
                     {
                         chunkLocationRealArr[globalIndex.to_ulong() >> chunkSize] = 0;
-                        cudaMemcpyAsync(svRealCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyDeviceToHost, streamArr[gpuIdx][streamIdx]);
+                        cudaMemcpyAsync(svRealCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], deviceRealCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svRealCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyDeviceToHost, streamArr[gpuIdx][streamIdx]);
                     }
 
                     if (errorImagCpuMalloc != cudaSuccess)
                     {
                         chunkLocationImagArr[globalIndex.to_ulong() >> chunkSize] = 1;
                         std::string filePathStrImag = ssdPath + std::to_string(globalIndex.to_ulong() >> chunkSize) + ".imag";
-                        cufileWrite(filePathStrImag.c_str(), deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
+                        cufileWrite(filePathStrImag.c_str(), deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize]);
                     }
                     else
                     {
                         chunkLocationImagArr[globalIndex.to_ulong() >> chunkSize] = 0;
-                        cudaMemcpyAsync(svImagCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyDeviceToHost, streamArr[gpuIdx][streamIdx]);
+                        cudaMemcpyAsync(svImagCompressedPtrArrHost[globalIndex.to_ulong() >> chunkSize], deviceImagCompressedBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * compressedStride, svImagCompressedSizePtrArrHost[globalIndex.to_ulong() >> chunkSize], cudaMemcpyDeviceToHost, streamArr[gpuIdx][streamIdx]);
                     }
 
                     cudaMemcpyAsync(svRealSignPtrHost[globalIndex.to_ulong() >> chunkSize], deviceRealSignBufferArr[gpuIdx][streamIdx] + tmpGlobalInnerIndex * exp2Int(chunkSize), sizeof(int8_t) * exp2Int(chunkSize), cudaMemcpyDeviceToHost, streamArr[gpuIdx][streamIdx]);
@@ -980,6 +1026,9 @@ namespace SVSim
             // Free CUDA streams
             for (IdxType tmpIdx = 0; tmpIdx < numGpus; tmpIdx++)
             {
+#ifdef BMQSIM_USE_PFPL
+                cudaSafeCall(cudaSetDevice(tmpIdx));
+#endif
                 cudaStreamDestroy(streamArr[tmpIdx][0]);
                 cudaStreamDestroy(streamArr[tmpIdx][1]);
                 free(streamArr[tmpIdx]);
@@ -989,6 +1038,9 @@ namespace SVSim
             // free the bitcomp plan
             for (IdxType tmpIdx = 0; tmpIdx < numGpus; tmpIdx++)
             {
+#ifdef BMQSIM_USE_PFPL
+                cudaSafeCall(cudaSetDevice(tmpIdx));
+#endif
                 for (IdxType tmpIdx2 = 0; tmpIdx2 < 2; tmpIdx2++)
                 {
                     bitcompDestroyPlan(planArr[tmpIdx][tmpIdx2]);
@@ -1121,12 +1173,12 @@ namespace SVSim
         void decompSv(std::string outputPath)
         {
             bitcompHandle_t plan;
-            bitcompCreatePlan(
+            BMQSIM_CHECK_CODEC(bitcompCreatePlan(
                 &plan,                                // Bitcomp handle
                 sizeof(ValType) * exp2Int(chunkSize), // Size in bytes of the uncompressed data
                 BITCOMP_FP64_DATA,                    // Data type
                 BITCOMP_LOSSY_FP_TO_SIGNED,           // Compression type
-                BITCOMP_DEFAULT_ALGO);                // Bitcomp algo, default or sparse
+                BITCOMP_DEFAULT_ALGO));                // Bitcomp algo, default or sparse
 
             SAFE_ALOC_HOST(svRealPtrHost, svSize);
             SAFE_ALOC_HOST(svImagPtrHost, svSize);
